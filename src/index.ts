@@ -1,8 +1,10 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { z } from "zod";
 import axios from 'axios';
 import dotenv from 'dotenv';
+import express, { Request, Response } from 'express';
+import cors from 'cors';
 
 dotenv.config();
 
@@ -26,6 +28,15 @@ interface LogResponse {
   data: any[];
   error?: string;
 }
+
+// Register the echo tool
+server.tool(
+  "echo",
+  { message: z.string() },
+  async ({ message }) => ({
+    content: [{ type: "text", text: `Tool echo: ${message}` }]
+  })
+);
 
 // Helper function to make API requests
 async function fetchLogs(type: LogType, playerId?: string, limit: number = 10): Promise<LogResponse> {
@@ -57,8 +68,8 @@ server.tool(
   'getLogs',
   {
     logType: LogType,
-    playerId: z.string().optional(),
-    limit: z.number().default(10)
+    playerId: z.string(),
+    limit: z.number().optional().default(10)
   },
   async (params, _extra) => {
     const { logType, playerId, limit } = params;
@@ -72,6 +83,74 @@ server.tool(
   }
 );
 
+// Create Express app
+const app = express();
+
+
+// Store active transports
+const transports: {[sessionId: string]: SSEServerTransport} = {};
+
+// SSE endpoint
+app.get("/sse", async (req: Request, res: Response) => {
+  try {
+    console.log("--> Received SSE connection request");
+    const transport = new SSEServerTransport('/messages', res);
+    transports[transport.sessionId] = transport;
+    
+    console.log("Transport created with sessionId:", transport.sessionId);
+    
+    // Single cleanup handler
+    res.on("close", () => {
+      console.log('SSE connection closed for session:', transport.sessionId);
+      delete transports[transport.sessionId];
+    });
+
+    // Handle errors
+    res.on("error", (error) => {
+      console.error('SSE connection error for session:', transport.sessionId, error);
+      if (!res.writableEnded) {
+        res.end();
+      }
+    });
+    
+    // Connect server to transport
+    await server.connect(transport);
+    console.log("Server connected to transport for session:", transport.sessionId);
+  } catch (error) {
+    console.error('Error in SSE connection:', error);
+    if (!res.writableEnded) {
+      res.status(500).end();
+    }
+  }
+});
+
+// Message endpoint
+app.post("/messages", async (req: Request, res: Response) => {
+  try {
+    const sessionId = req.query.sessionId as string;
+    console.log("--> Received POST message for session:", sessionId);
+    
+    const transport = transports[sessionId];
+    if (!transport) {
+      console.error("No transport found for session:", sessionId);
+      res.status(400).send('No transport found for sessionId');
+      return;
+    }
+
+    console.log("Found transport, handling message...");
+    await transport.handlePostMessage(req, res);
+    console.log("<-- Message handled for session:", sessionId);
+    
+  } catch (error) {
+    console.error('Error handling message:', error);
+    res.status(500).send('Internal server error');
+  }
+});
+
 // Start the server
-const transport = new StdioServerTransport();
-server.connect(transport).catch(console.error); 
+const PORT = process.env.PORT || 3001;
+app.listen(PORT, () => {
+  console.log(`MCP Server running on port ${PORT}`);
+  console.log(`SSE endpoint: http://localhost:${PORT}/sse`);
+  console.log(`Message endpoint: http://localhost:${PORT}/messages`);
+}); 
